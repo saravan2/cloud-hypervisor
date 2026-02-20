@@ -21,12 +21,12 @@ build_edk2() {
     fi
 
     # Prepare source code
-    checkout_repo "$EDK2_DIR" "$EDK2_REPO" master "22130dcd98b4d4b76ac8d922adb4a2dbc86fa52c"
+    checkout_repo "$EDK2_DIR" "$EDK2_REPO" master "8ba02634ecaa6ff5d0edcea266198f42eca90c53"
     pushd "$EDK2_DIR" || exit
     git submodule update --init
     popd || exit
     checkout_repo "$EDK2_PLAT_DIR" "$EDK2_PLAT_REPO" master "8227e9e9f6a8aefbd772b40138f835121ccb2307"
-    checkout_repo "$ACPICA_DIR" "$ACPICA_REPO" master "e80cbd7b52de20aa8c75bfba9845e9cb61f2e681"
+    checkout_repo "$ACPICA_DIR" "$ACPICA_REPO" master "446be438238e9d339eed5182b807ac5f82df56c9"
 
     if [[ ! -f "$EDK2_DIR/.built" ||
         ! -f "$EDK2_PLAT_DIR/.built" ||
