@@ -2239,7 +2239,7 @@ impl DebugConsoleConfig {
 
 impl DeviceConfig {
     pub const SYNTAX: &'static str = "Direct device assignment parameters \
-    \"path=<device_path>,iommu=on|off,id=<device_id>,\
+    \"path=<device_path>,fd=<vfio_cdev_fd>,iommu=on|off,id=<device_id>,\
     pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
     x_nv_gpudirect_clique=<clique_id>,\
     x_exclude_mmap_bars=[<bar>...]\"";
@@ -2248,6 +2248,7 @@ impl DeviceConfig {
         let mut parser = OptionParser::new();
         parser
             .add("path")
+            .add("fd")
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU)
             .add("x_nv_gpudirect_clique")
             .add("x_exclude_mmap_bars");
@@ -2258,6 +2259,7 @@ impl DeviceConfig {
             .get("path")
             .map(PathBuf::from)
             .ok_or(Error::ParseDevicePathMissing)?;
+        let fd = parser.convert::<i32>("fd").map_err(Error::ParseDevice)?;
         let x_nv_gpudirect_clique = parser
             .convert::<u8>("x_nv_gpudirect_clique")
             .map_err(Error::ParseDevice)?;
@@ -2269,6 +2271,7 @@ impl DeviceConfig {
         Ok(DeviceConfig {
             pci_common,
             path: Some(path),
+            fd,
             x_nv_gpudirect_clique,
             x_exclude_mmap_bars,
         })
@@ -4447,6 +4450,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         DeviceConfig {
             pci_common: PciDeviceCommonConfig::default(),
             path: Some(PathBuf::from("/path/to/device")),
+            fd: None,
             x_nv_gpudirect_clique: None,
             x_exclude_mmap_bars: Vec::new(),
         }
