@@ -43,7 +43,13 @@ use vm_device::interrupt::{
     InterruptIndex, InterruptManager, InterruptSourceGroup, MsiIrqGroupConfig,
 };
 use vm_device::{BusDevice, Resource};
-use vm_memory::{Address, GuestAddress, GuestAddressSpace, GuestMemory, GuestUsize};
+use vm_memory::bitmap::AtomicBitmap;
+use vm_memory::{
+    Address, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic, GuestMemoryRegion,
+    GuestUsize,
+};
+
+type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
 use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
@@ -1708,6 +1714,53 @@ impl VfioCommon {
         result
     }
 
+    // No-op when the device hasn't advertised migration support, so callers
+    // can dispatch unconditionally.
+    pub(crate) fn start_dirty_log(
+        &self,
+        ranges: &[DmaLoggingRange],
+        page_size: u64,
+    ) -> Result<(), MigratableError> {
+        if self.migration_flags.is_none() {
+            return Ok(());
+        }
+        self.vfio_wrapper
+            .start_dma_logging(page_size, ranges)
+            .map_err(|e| MigratableError::StartDirtyLog(anyhow!("VFIO start_dma_logging: {e}")))
+    }
+
+    pub(crate) fn stop_dirty_log(&self) -> Result<(), MigratableError> {
+        if self.migration_flags.is_none() {
+            return Ok(());
+        }
+        self.vfio_wrapper
+            .stop_dma_logging()
+            .map_err(|e| MigratableError::StopDirtyLog(anyhow!("VFIO stop_dma_logging: {e}")))
+    }
+
+    // Reports per-range dirty bitmaps from the kernel, merging them into a
+    // single MemoryRangeTable. Returns an empty table when migration is
+    // unsupported so the caller can splice it into the union without a
+    // special case.
+    pub(crate) fn dirty_log(
+        &self,
+        ranges: &[DmaLoggingRange],
+        page_size: u64,
+    ) -> Result<MemoryRangeTable, MigratableError> {
+        if self.migration_flags.is_none() {
+            return Ok(MemoryRangeTable::default());
+        }
+        let mut tables = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let table = self
+                .vfio_wrapper
+                .report_dma_logging(*range, page_size)
+                .map_err(|e| MigratableError::DirtyLog(anyhow!("VFIO report_dma_logging: {e}")))?;
+            tables.push(table);
+        }
+        Ok(MemoryRangeTable::new_from_tables(tables))
+    }
+
     // Pull the VFIO migration blob out of `snapshot` (if present) and stream
     // it into the kernel via load_migration_data. Caller is responsible for
     // the post-restore rewire (PCI_COMMAND write, MSI/MSI-X rearm).
@@ -1798,6 +1851,10 @@ pub struct VfioPciDevice {
     // Required for peer-to-peer DMA between VFIO devices.
     p2p_dma: bool,
     memory_slot_allocator: MemorySlotAllocator,
+    // Used by the Migratable impl to enumerate guest memory regions
+    // when programming VFIO DMA logging. Only the !iommu_attached
+    // path is wired today; iommu_attached coverage is a follow-up.
+    memory: GuestMemoryAtomic<GuestMemoryMmap>,
     bdf: PciBdf,
     device_path: PathBuf,
 }
@@ -1816,6 +1873,7 @@ impl VfioPciDevice {
         p2p_dma: bool,
         bdf: PciBdf,
         memory_slot_allocator: MemorySlotAllocator,
+        memory: GuestMemoryAtomic<GuestMemoryMmap>,
         snapshot: Option<&Snapshot>,
         x_nv_gpudirect_clique: Option<u8>,
         x_exclude_mmap_bars: Vec<u8>,
@@ -1848,6 +1906,7 @@ impl VfioPciDevice {
             iommu_attached,
             p2p_dma,
             memory_slot_allocator,
+            memory,
             bdf,
             device_path,
         };
@@ -2421,7 +2480,62 @@ impl Snapshottable for VfioPciDevice {
 }
 
 impl Transportable for VfioPciDevice {}
-impl Migratable for VfioPciDevice {}
+
+impl VfioPciDevice {
+    // Build the IOVA range list passed to VFIO DMA logging. For the
+    // !iommu_attached path this is the guest memory layout: DeviceManager
+    // installs an identity mapping (iova == gpa) for every guest memory
+    // region at boot, so the kernel sees exactly these IOVAs.
+    //
+    // Returns an empty vec when iommu_attached is true. iommu-attached
+    // devices have their IOVAs driven by the virtual IOMMU and are tracked
+    // via VfioDmaMapping; that wiring is a follow-up commit.
+    fn dirty_log_iova_ranges(&self) -> Vec<DmaLoggingRange> {
+        if self.iommu_attached {
+            return Vec::new();
+        }
+        let mem = self.memory.memory();
+        mem.iter()
+            .map(|region| DmaLoggingRange {
+                iova: region.start_addr().raw_value(),
+                length: region.len(),
+            })
+            .collect()
+    }
+}
+
+impl Migratable for VfioPciDevice {
+    fn start_dirty_log(&mut self) -> std::result::Result<(), MigratableError> {
+        let ranges = self.dirty_log_iova_ranges();
+        let page_size = get_page_size();
+        self.common.start_dirty_log(&ranges, page_size)
+    }
+
+    fn stop_dirty_log(&mut self) -> std::result::Result<(), MigratableError> {
+        self.common.stop_dirty_log()
+    }
+
+    fn dirty_log(&mut self) -> std::result::Result<MemoryRangeTable, MigratableError> {
+        let ranges = self.dirty_log_iova_ranges();
+        let page_size = get_page_size();
+        self.common.dirty_log(&ranges, page_size)
+    }
+
+    fn start_migration(&mut self) -> std::result::Result<(), MigratableError> {
+        // Phase 5 will transition Running -> PreCopy here for PRE_COPY-capable
+        // devices. For the first cut, source-side stop-and-copy is driven by
+        // the existing snapshot path during Pausable::pause + Snapshottable.
+        Ok(())
+    }
+
+    fn complete_migration(&mut self) -> std::result::Result<(), MigratableError> {
+        // The cross-host live migration receive path will call this on the
+        // destination after the migration blob has arrived to flush it into
+        // the kernel via restore_migration_data_from_snapshot. Wiring lands
+        // with the L5 cross-host integration tests.
+        Ok(())
+    }
+}
 
 /// This structure implements the ExternalDmaMapping trait. It is meant to
 /// be used when the caller tries to provide a way to update the mappings
@@ -2846,6 +2960,73 @@ mod tests {
         assert_eq!(ranges[0].length, page_size * 2);
         assert_eq!(ranges[1].gpa, 0x1_0000_0000 + 4 * page_size);
         assert_eq!(ranges[1].length, page_size);
+    }
+
+    #[test]
+    fn dirty_log_helpers_short_circuit_without_migration_flags() {
+        let mock = MockVfio::for_dma_logging(vec![0xFFFF_FFFF_FFFF_FFFF]);
+        let common = test_vfio_common(mock.clone(), None);
+        let range = DmaLoggingRange {
+            iova: 0,
+            length: 0x1000,
+        };
+
+        common.start_dirty_log(&[range], 0x1000).unwrap();
+        common.stop_dirty_log().unwrap();
+        let table = common.dirty_log(&[range], 0x1000).unwrap();
+
+        assert!(table.ranges().is_empty());
+        assert!(!mock.dma_logging_started());
+        let (page_size, recorded) = mock.dma_logging_recorded();
+        assert_eq!(page_size, 0);
+        assert!(recorded.is_empty());
+    }
+
+    #[test]
+    fn start_stop_dirty_log_drives_mock_when_migration_enabled() {
+        let mock = MockVfio::for_dma_logging(Vec::new());
+        let common = test_vfio_common(mock.clone(), Some(1));
+        let ranges = [DmaLoggingRange {
+            iova: 0x4000,
+            length: 0x2000,
+        }];
+
+        common.start_dirty_log(&ranges, 0x1000).unwrap();
+        assert!(mock.dma_logging_started());
+        let (page_size, recorded) = mock.dma_logging_recorded();
+        assert_eq!(page_size, 0x1000);
+        assert_eq!(recorded, ranges);
+
+        common.stop_dirty_log().unwrap();
+        assert!(!mock.dma_logging_started());
+    }
+
+    #[test]
+    fn dirty_log_merges_ranges_into_one_table() {
+        // Mock returns the same canned bitmap for each report call. With
+        // bit 0 set, each range contributes its first page.
+        let bitmap = vec![0b1_u64];
+        let mock = MockVfio::for_dma_logging(bitmap);
+        let common = test_vfio_common(mock, Some(1));
+        let page_size: u64 = 0x1000;
+        let ranges = [
+            DmaLoggingRange {
+                iova: 0x1_0000_0000,
+                length: page_size * 64,
+            },
+            DmaLoggingRange {
+                iova: 0x2_0000_0000,
+                length: page_size * 64,
+            },
+        ];
+
+        let table = common.dirty_log(&ranges, page_size).unwrap();
+        let merged = table.ranges();
+        assert_eq!(merged.len(), 2);
+        let mut starts: Vec<u64> = merged.iter().map(|r| r.gpa).collect();
+        starts.sort();
+        assert_eq!(starts, vec![0x1_0000_0000, 0x2_0000_0000]);
+        assert!(merged.iter().all(|r| r.length == page_size));
     }
 
     fn snapshot_with_migration_blob(payload: &[u8]) -> Snapshot {

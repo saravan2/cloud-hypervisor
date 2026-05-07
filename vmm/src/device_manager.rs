@@ -3946,6 +3946,11 @@ impl DeviceManager {
             .as_ref()
             .is_none_or(|p| p.vfio_p2p_dma);
 
+        let (memory_slot_allocator, guest_memory) = {
+            let mut mm = memory_manager.lock().unwrap();
+            (mm.memory_slot_allocator(), mm.guest_memory())
+        };
+
         let vfio_pci_device = VfioPciDevice::new(
             vfio_name.clone(),
             self.address_manager.vm.clone(),
@@ -3956,7 +3961,8 @@ impl DeviceManager {
             device_cfg.pci_common.iommu,
             vfio_p2p_dma,
             pci_device_bdf,
-            memory_manager.lock().unwrap().memory_slot_allocator(),
+            memory_slot_allocator,
+            guest_memory,
             vm_migration::snapshot_from_id(self.snapshot.as_ref(), vfio_name.as_str()),
             device_cfg.x_nv_gpudirect_clique,
             device_cfg
