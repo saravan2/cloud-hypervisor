@@ -750,24 +750,8 @@ impl VfioCommon {
         if let Some(state) = state.as_ref() {
             vfio_common.set_state(state, msi_state, msix_state)?;
 
-            if vfio_common.migration_flags.is_some() {
-                let mig: Option<VfioMigrationData> =
-                    vm_migration::state_from_id(snapshot, VFIO_MIGRATION_ID).map_err(|e| {
-                        VfioPciError::RestoreMigration(anyhow!(
-                            "Failed to get VfioMigrationData from Snapshot: {e}"
-                        ))
-                    })?;
-
-                if let Some(mig) = mig {
-                    let blob = BASE64_STANDARD.decode(mig.blob.as_bytes()).map_err(|e| {
-                        VfioPciError::RestoreMigration(anyhow!(
-                            "Failed to base64-decode migration blob: {e}"
-                        ))
-                    })?;
-                    vfio_common
-                        .load_migration_data(&blob)
-                        .map_err(|e| VfioPciError::RestoreMigration(anyhow!("{e}")))?;
-                }
+            if let Some(snapshot) = snapshot {
+                vfio_common.restore_migration_data_from_snapshot(snapshot)?;
             }
 
             // Push PCI_COMMAND to the device as set_state() does not.
@@ -1722,6 +1706,40 @@ impl VfioCommon {
             let _ = self.transition_migration_state(VfioMigrationState::Stop);
         }
         result
+    }
+
+    // Pull the VFIO migration blob out of `snapshot` (if present) and stream
+    // it into the kernel via load_migration_data. Caller is responsible for
+    // the post-restore rewire (PCI_COMMAND write, MSI/MSI-X rearm).
+    //
+    // Returns Ok(()) when migration_flags is None or no VFIO_MIGRATION_ID
+    // child is present, so the live migration receive path can call this
+    // unconditionally.
+    pub(crate) fn restore_migration_data_from_snapshot(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<(), VfioPciError> {
+        if self.migration_flags.is_none() {
+            return Ok(());
+        }
+
+        let mig: Option<VfioMigrationData> =
+            vm_migration::state_from_id(Some(snapshot), VFIO_MIGRATION_ID).map_err(|e| {
+                VfioPciError::RestoreMigration(anyhow!(
+                    "Failed to get VfioMigrationData from Snapshot: {e}"
+                ))
+            })?;
+
+        let Some(mig) = mig else {
+            return Ok(());
+        };
+
+        let blob = BASE64_STANDARD.decode(mig.blob.as_bytes()).map_err(|e| {
+            VfioPciError::RestoreMigration(anyhow!("Failed to base64-decode migration blob: {e}"))
+        })?;
+
+        self.load_migration_data(&blob)
+            .map_err(|e| VfioPciError::RestoreMigration(anyhow!("{e}")))
     }
 }
 
@@ -2828,6 +2846,60 @@ mod tests {
         assert_eq!(ranges[0].length, page_size * 2);
         assert_eq!(ranges[1].gpa, 0x1_0000_0000 + 4 * page_size);
         assert_eq!(ranges[1].length, page_size);
+    }
+
+    fn snapshot_with_migration_blob(payload: &[u8]) -> Snapshot {
+        let mig = VfioMigrationData {
+            blob: BASE64_STANDARD.encode(payload),
+        };
+        let mig_snapshot = Snapshot::new_from_state(&mig).unwrap();
+        let mut snapshot = Snapshot::default();
+        snapshot.add_snapshot(VFIO_MIGRATION_ID.to_string(), mig_snapshot);
+        snapshot
+    }
+
+    #[test]
+    fn restore_migration_data_from_snapshot_loads_blob() {
+        let mock = MockVfio::for_load();
+        let common = test_vfio_common(mock.clone(), Some(1));
+        let payload = b"hello migration".to_vec();
+        let snapshot = snapshot_with_migration_blob(&payload);
+
+        common
+            .restore_migration_data_from_snapshot(&snapshot)
+            .unwrap();
+        assert_eq!(mock.loaded(), payload);
+        assert_eq!(
+            mock.transitions(),
+            vec![VfioMigrationState::Resuming]
+        );
+    }
+
+    #[test]
+    fn restore_migration_data_from_snapshot_skips_when_no_blob() {
+        let mock = MockVfio::for_load();
+        let common = test_vfio_common(mock.clone(), Some(1));
+        let snapshot = Snapshot::default();
+
+        common
+            .restore_migration_data_from_snapshot(&snapshot)
+            .unwrap();
+        assert!(mock.loaded().is_empty());
+        assert!(mock.transitions().is_empty());
+    }
+
+    #[test]
+    fn restore_migration_data_from_snapshot_skips_when_no_migration_flags() {
+        let mock = MockVfio::for_load();
+        let common = test_vfio_common(mock.clone(), None);
+        let payload = b"would-be blob".to_vec();
+        let snapshot = snapshot_with_migration_blob(&payload);
+
+        common
+            .restore_migration_data_from_snapshot(&snapshot)
+            .unwrap();
+        assert!(mock.loaded().is_empty());
+        assert!(mock.transitions().is_empty());
     }
 
     // A guest write to a non BAR, non MSI config register must mirror into
