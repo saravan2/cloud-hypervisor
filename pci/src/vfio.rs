@@ -1851,10 +1851,13 @@ pub struct VfioPciDevice {
     // Required for peer-to-peer DMA between VFIO devices.
     p2p_dma: bool,
     memory_slot_allocator: MemorySlotAllocator,
-    // Used by the Migratable impl to enumerate guest memory regions
-    // when programming VFIO DMA logging. Only the !iommu_attached
-    // path is wired today; iommu_attached coverage is a follow-up.
+    // Source of IOVA ranges for the !iommu_attached path: enumerated from
+    // guest memory at dirty-log time, with iova == gpa.
     memory: GuestMemoryAtomic<GuestMemoryMmap>,
+    // Source of IOVA ranges for the iommu_attached path: shared with the
+    // VfioDmaMapping bound to this device's BDF, populated on map/unmap.
+    // None for !iommu_attached devices.
+    dma_logging_tracker: Option<DmaLoggingTracker>,
     bdf: PciBdf,
     device_path: PathBuf,
 }
@@ -1874,6 +1877,7 @@ impl VfioPciDevice {
         bdf: PciBdf,
         memory_slot_allocator: MemorySlotAllocator,
         memory: GuestMemoryAtomic<GuestMemoryMmap>,
+        dma_logging_tracker: Option<DmaLoggingTracker>,
         snapshot: Option<&Snapshot>,
         x_nv_gpudirect_clique: Option<u8>,
         x_exclude_mmap_bars: Vec<u8>,
@@ -1907,6 +1911,7 @@ impl VfioPciDevice {
             p2p_dma,
             memory_slot_allocator,
             memory,
+            dma_logging_tracker,
             bdf,
             device_path,
         };
@@ -2482,17 +2487,22 @@ impl Snapshottable for VfioPciDevice {
 impl Transportable for VfioPciDevice {}
 
 impl VfioPciDevice {
-    // Build the IOVA range list passed to VFIO DMA logging. For the
-    // !iommu_attached path this is the guest memory layout: DeviceManager
-    // installs an identity mapping (iova == gpa) for every guest memory
-    // region at boot, so the kernel sees exactly these IOVAs.
+    // Build the IOVA range list passed to VFIO DMA logging.
     //
-    // Returns an empty vec when iommu_attached is true. iommu-attached
-    // devices have their IOVAs driven by the virtual IOMMU and are tracked
-    // via VfioDmaMapping; that wiring is a follow-up commit.
+    // !iommu_attached: DeviceManager installs an identity mapping
+    // (iova == gpa) for every guest memory region at boot, so the kernel
+    // sees exactly these IOVAs. Enumerate them from the live memory layout.
+    //
+    // iommu_attached: ranges come from the virtual IOMMU via VfioDmaMapping
+    // map/unmap calls, recorded in dma_logging_tracker. Clone the snapshot
+    // so the lock is released before the kernel ioctl.
     fn dirty_log_iova_ranges(&self) -> Vec<DmaLoggingRange> {
         if self.iommu_attached {
-            return Vec::new();
+            return self
+                .dma_logging_tracker
+                .as_ref()
+                .map(|t| t.lock().unwrap().clone())
+                .unwrap_or_default();
         }
         let mem = self.memory.memory();
         mem.iter()
@@ -2537,6 +2547,36 @@ impl Migratable for VfioPciDevice {
     }
 }
 
+/// Shared tracker of IOVAs the kernel currently has DMA-mapped for an
+/// iommu-attached VFIO device. Populated by `VfioDmaMapping::map`/`unmap`
+/// and read by `VfioPciDevice::dirty_log_iova_ranges` to drive VFIO DMA
+/// logging. The non-iommu path does not use this; it derives ranges from
+/// the guest memory layout directly.
+pub type DmaLoggingTracker = Arc<Mutex<Vec<DmaLoggingRange>>>;
+
+fn record_dma_mapping(tracker: &Option<DmaLoggingTracker>, iova: u64, length: u64) {
+    if let Some(t) = tracker {
+        t.lock().unwrap().push(DmaLoggingRange { iova, length });
+    }
+}
+
+fn forget_dma_mapping(tracker: &Option<DmaLoggingTracker>, iova: u64, length: u64) {
+    let Some(t) = tracker else { return };
+    let mut ranges = t.lock().unwrap();
+    let target = DmaLoggingRange { iova, length };
+    if let Some(pos) = ranges.iter().position(|r| *r == target) {
+        ranges.swap_remove(pos);
+    } else {
+        // Partial unmap of a previously recorded range. Kernel accepts
+        // this; our tracker over-reports until the device is destroyed.
+        // Rare under virtio-iommu; revisit if it shows up in practice.
+        warn!(
+            "VFIO DMA logging tracker: unmap iova 0x{iova:x} size 0x{length:x} \
+             does not match any recorded range"
+        );
+    }
+}
+
 /// This structure implements the ExternalDmaMapping trait. It is meant to
 /// be used when the caller tries to provide a way to update the mappings
 /// associated with a specific VfioOps instance.
@@ -2544,6 +2584,7 @@ pub struct VfioDmaMapping<M: GuestAddressSpace> {
     vfio_ops: Arc<dyn VfioOps>,
     memory: Arc<M>,
     mmio_regions: Arc<Mutex<Vec<MmioRegion>>>,
+    dma_logging_tracker: Option<DmaLoggingTracker>,
 }
 
 impl<M: GuestAddressSpace> VfioDmaMapping<M> {
@@ -2552,15 +2593,20 @@ impl<M: GuestAddressSpace> VfioDmaMapping<M> {
     /// * `vfio_ops`: VfioOps instance.
     /// * `memory`: guest memory to mmap.
     /// * `mmio_regions`: mmio_regions to mmap.
+    /// * `dma_logging_tracker`: shared IOVA tracker for VFIO DMA logging.
+    ///   Populated on map/unmap success. Pass `None` when the caller does
+    ///   not need DMA logging coverage on this mapping path.
     pub fn new(
         vfio_ops: Arc<dyn VfioOps>,
         memory: Arc<M>,
         mmio_regions: Arc<Mutex<Vec<MmioRegion>>>,
+        dma_logging_tracker: Option<DmaLoggingTracker>,
     ) -> Self {
         VfioDmaMapping {
             vfio_ops,
             memory,
             mmio_regions,
+            dma_logging_tracker,
         }
     }
 }
@@ -2610,7 +2656,10 @@ impl<M: GuestAddressSpace + Sync + Send> ExternalDmaMapping for VfioDmaMapping<M
                 "failed to map memory into the host IOMMU address space, \
                          iova 0x{iova:x}, gpa 0x{gpa:x}, size 0x{size:x}: {e:?}"
             ))
-        })
+        })?;
+
+        record_dma_mapping(&self.dma_logging_tracker, iova, size);
+        Ok(())
     }
 
     fn unmap(&self, iova: u64, size: u64) -> std::result::Result<(), io::Error> {
@@ -2621,7 +2670,10 @@ impl<M: GuestAddressSpace + Sync + Send> ExternalDmaMapping for VfioDmaMapping<M
                     "failed to unmap memory from the host IOMMU address space, \
                      iova 0x{iova:x}, size 0x{size:x}: {e:?}"
                 ))
-            })
+            })?;
+
+        forget_dma_mapping(&self.dma_logging_tracker, iova, size);
+        Ok(())
     }
 }
 
@@ -2960,6 +3012,47 @@ mod tests {
         assert_eq!(ranges[0].length, page_size * 2);
         assert_eq!(ranges[1].gpa, 0x1_0000_0000 + 4 * page_size);
         assert_eq!(ranges[1].length, page_size);
+    }
+
+    #[test]
+    fn record_and_forget_round_trip_clears_tracker() {
+        let tracker: DmaLoggingTracker = Arc::new(Mutex::new(Vec::new()));
+        let some = Some(Arc::clone(&tracker));
+
+        record_dma_mapping(&some, 0x1000, 0x4000);
+        record_dma_mapping(&some, 0x8000, 0x2000);
+        assert_eq!(tracker.lock().unwrap().len(), 2);
+
+        forget_dma_mapping(&some, 0x1000, 0x4000);
+        forget_dma_mapping(&some, 0x8000, 0x2000);
+        assert!(tracker.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn forget_partial_unmap_keeps_recorded_range() {
+        let tracker: DmaLoggingTracker = Arc::new(Mutex::new(Vec::new()));
+        let some = Some(Arc::clone(&tracker));
+        record_dma_mapping(&some, 0x1000, 0x4000);
+
+        // Length mismatch (sub-range unmap). Tracker should retain the
+        // original entry rather than silently mutating it.
+        forget_dma_mapping(&some, 0x1000, 0x2000);
+
+        let snap = tracker.lock().unwrap().clone();
+        assert_eq!(
+            snap,
+            vec![DmaLoggingRange {
+                iova: 0x1000,
+                length: 0x4000
+            }]
+        );
+    }
+
+    #[test]
+    fn record_and_forget_are_no_ops_without_tracker() {
+        let none: Option<DmaLoggingTracker> = None;
+        record_dma_mapping(&none, 0x1000, 0x4000);
+        forget_dma_mapping(&none, 0x1000, 0x4000);
     }
 
     #[test]

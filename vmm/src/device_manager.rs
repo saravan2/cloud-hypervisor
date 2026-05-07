@@ -75,8 +75,8 @@ use libc::{
 };
 use log::{debug, error, info, warn};
 use pci::{
-    DeviceRelocation, MmioRegion, PciBarRegionType, PciBdf, PciDevice, VfioDmaMapping,
-    VfioPciDevice, VfioUserDmaMapping, VfioUserPciDevice, VfioUserPciDeviceError,
+    DeviceRelocation, DmaLoggingTracker, MmioRegion, PciBarRegionType, PciBdf, PciDevice,
+    VfioDmaMapping, VfioPciDevice, VfioUserDmaMapping, VfioUserPciDevice, VfioUserPciDeviceError,
 };
 use rate_limiter::group::RateLimiterGroup;
 use seccompiler::SeccompAction;
@@ -3840,13 +3840,16 @@ impl DeviceManager {
         // container/group. The VFIO cdev and iommufd do not have such a
         // limitation, and this will be revised once we have VFIO cdev and
         // iommufd support.
-        let vfio_ops = if device_cfg.pci_common.iommu {
+        let (vfio_ops, dma_logging_tracker) = if device_cfg.pci_common.iommu {
             let vfio_ops = self.create_vfio_ops()?;
+
+            let tracker: DmaLoggingTracker = Arc::new(Mutex::new(Vec::new()));
 
             let vfio_mapping = Arc::new(VfioDmaMapping::new(
                 Arc::clone(&vfio_ops),
                 Arc::new(self.memory_manager.lock().unwrap().guest_memory()),
                 Arc::clone(&self.mmio_regions),
+                Some(Arc::clone(&tracker)),
             ));
 
             if let Some(iommu) = &self.iommu_device {
@@ -3858,15 +3861,15 @@ impl DeviceManager {
                 return Err(DeviceManagerError::MissingVirtualIommu);
             }
 
-            vfio_ops
+            (vfio_ops, Some(tracker))
         } else if let Some(vfio_ops) = &self.vfio_ops {
-            Arc::clone(vfio_ops)
+            (Arc::clone(vfio_ops), None)
         } else {
             let vfio_ops = self.create_vfio_ops()?;
             needs_dma_mapping = true;
             self.vfio_ops = Some(Arc::clone(&vfio_ops));
 
-            vfio_ops
+            (vfio_ops, None)
         };
 
         let (vfio_device, device_path) = match (&device_cfg.path, device_cfg.fd) {
@@ -3907,6 +3910,7 @@ impl DeviceManager {
                 Arc::clone(&vfio_ops),
                 Arc::new(self.memory_manager.lock().unwrap().guest_memory()),
                 Arc::clone(&self.mmio_regions),
+                None,
             ));
 
             for virtio_mem_device in self.virtio_mem_devices.iter() {
@@ -3963,6 +3967,7 @@ impl DeviceManager {
             pci_device_bdf,
             memory_slot_allocator,
             guest_memory,
+            dma_logging_tracker,
             vm_migration::snapshot_from_id(self.snapshot.as_ref(), vfio_name.as_str()),
             device_cfg.x_nv_gpudirect_clique,
             device_cfg
