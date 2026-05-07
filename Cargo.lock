@@ -2372,12 +2372,12 @@ dependencies = [
 [[package]]
 name = "vfio-bindings"
 version = "0.6.2"
-source = "git+https://github.com/saravan2/vfio.git?branch=vfio-ioctls#68097e9d4a8841c29d2652d667fdb71c785197dd"
+source = "git+https://github.com/saravan2/vfio.git?branch=vfio-dma-logging#59ac2f7fbdd9655cf3705f5e97680bfe0f79666f"
 
 [[package]]
 name = "vfio-ioctls"
 version = "0.6.0"
-source = "git+https://github.com/saravan2/vfio.git?branch=vfio-ioctls#68097e9d4a8841c29d2652d667fdb71c785197dd"
+source = "git+https://github.com/saravan2/vfio.git?branch=vfio-dma-logging#59ac2f7fbdd9655cf3705f5e97680bfe0f79666f"
 dependencies = [
  "byteorder",
  "iommufd-bindings",
@@ -2389,7 +2389,7 @@ dependencies = [
  "mshv-bindings",
  "mshv-ioctls",
  "thiserror",
- "vfio-bindings 0.6.2 (git+https://github.com/saravan2/vfio.git?branch=vfio-ioctls)",
+ "vfio-bindings 0.6.2 (git+https://github.com/saravan2/vfio.git?branch=vfio-dma-logging)",
  "vm-memory",
  "vmm-sys-util",
 ]

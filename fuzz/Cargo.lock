@@ -166,6 +166,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-buffer"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdd35008169921d80bc60d3d0ab416eecb028c4cd653352907921d95084790be"
+dependencies = [
+ "hybrid-array",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -276,6 +285,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "const-oid"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
 name = "cpufeatures"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -300,6 +315,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "crypto-common"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77727bb15fa921304124b128af125e7e3b968275d1b108b379190264f4423710"
+dependencies = [
+ "hybrid-array",
 ]
 
 [[package]]
@@ -365,6 +389,17 @@ dependencies = [
  "vm-memory",
  "vm-migration",
  "vmm-sys-util",
+]
+
+[[package]]
+name = "digest"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
+dependencies = [
+ "block-buffer",
+ "const-oid",
+ "crypto-common",
 ]
 
 [[package]]
@@ -563,6 +598,15 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hybrid-array"
+version = "0.4.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d46837a0ed51fe95bd3b05de33cd64a1ee88fc797477ca48446872504507c5"
+dependencies = [
+ "typenum",
+]
 
 [[package]]
 name = "hypervisor"
@@ -801,9 +845,9 @@ dependencies = [
 
 [[package]]
 name = "mshv-bindings"
-version = "0.6.8"
+version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a94fc3871dd23738188e5bc76a1d1a5930ebcaf9308c560a7274aa62b1770594"
+checksum = "83303108160c2b7a7bdd25000ee679384e19471386d23e501ed832574c9229ef"
 dependencies = [
  "libc",
  "num_enum",
@@ -1120,6 +1164,17 @@ name = "serial_buffer"
 version = "0.1.0"
 
 [[package]]
+name = "sha2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1255,6 +1310,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "typenum"
+version = "1.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1296,12 +1357,12 @@ dependencies = [
 [[package]]
 name = "vfio-bindings"
 version = "0.6.2"
-source = "git+https://github.com/saravan2/vfio.git?branch=vfio-ioctls#68097e9d4a8841c29d2652d667fdb71c785197dd"
+source = "git+https://github.com/saravan2/vfio.git?branch=vfio-dma-logging#59ac2f7fbdd9655cf3705f5e97680bfe0f79666f"
 
 [[package]]
 name = "vfio-ioctls"
 version = "0.6.0"
-source = "git+https://github.com/saravan2/vfio.git?branch=vfio-ioctls#68097e9d4a8841c29d2652d667fdb71c785197dd"
+source = "git+https://github.com/saravan2/vfio.git?branch=vfio-dma-logging#59ac2f7fbdd9655cf3705f5e97680bfe0f79666f"
 dependencies = [
  "byteorder",
  "iommufd-bindings",
@@ -1311,7 +1372,7 @@ dependencies = [
  "libc",
  "log",
  "thiserror",
- "vfio-bindings 0.6.2 (git+https://github.com/saravan2/vfio.git?branch=vfio-ioctls)",
+ "vfio-bindings 0.6.2 (git+https://github.com/saravan2/vfio.git?branch=vfio-dma-logging)",
  "vm-memory",
  "vmm-sys-util",
 ]
@@ -1488,6 +1549,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_buffer",
+ "sha2",
  "signal-hook",
  "thiserror",
  "tracer",

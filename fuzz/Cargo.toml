@@ -42,7 +42,7 @@ vmm-sys-util = "0.15.0"
 members = ["."]
 
 [patch.crates-io]
-vfio-ioctls = { git = "https://github.com/saravan2/vfio.git", branch = "vfio-ioctls" }
+vfio-ioctls = { git = "https://github.com/saravan2/vfio.git", branch = "vfio-dma-logging" }
 
 [[bin]]
 doc = false

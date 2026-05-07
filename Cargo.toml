@@ -131,4 +131,4 @@ unnecessary_semicolon = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(devcli_testenv)'] }
 
 [patch.crates-io]
-vfio-ioctls = { git = "https://github.com/saravan2/vfio.git", branch = "vfio-ioctls" }
+vfio-ioctls = { git = "https://github.com/saravan2/vfio.git", branch = "vfio-dma-logging" }
