@@ -1955,6 +1955,20 @@ impl RequestHandler for Vmm {
             }
         }
 
+        // Swap each VFIO device's saved path for the cdev FD passed in via vfio_fds.
+        if let (Some(restored_vfios), Some(vm_device_configs)) =
+            (restore_cfg.vfio_fds, &mut vm_config.lock().unwrap().devices)
+        {
+            for v in restored_vfios.iter() {
+                for device_config in vm_device_configs.iter_mut() {
+                    if device_config.pci_common.id.as_ref() == Some(&v.id) {
+                        device_config.path = None;
+                        device_config.fd = v.fd;
+                    }
+                }
+            }
+        }
+
         self.vm_restore(
             source_url,
             vm_config,

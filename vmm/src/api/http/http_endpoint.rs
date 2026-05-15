@@ -37,6 +37,7 @@
 use std::fs::File;
 use std::sync::mpsc::Sender;
 
+use log::error;
 use micro_http::{Body, Method, Request, Response, StatusCode, Version};
 use vmm_sys_util::eventfd::EventFd;
 
@@ -117,7 +118,7 @@ mod fds_helper {
         use std::os::fd::RawFd;
 
         use super::{ConfigWithFDs, ConfigWithVariableFDs};
-        use crate::config::RestoredNetConfig;
+        use crate::config::{RestoredNetConfig, RestoredVfioConfig};
         use crate::vm_config::{DeviceConfig, NetConfig};
 
         impl ConfigWithFDs for NetConfig {
@@ -169,6 +170,26 @@ mod fds_helper {
         impl ConfigWithVariableFDs for RestoredNetConfig {
             fn expected_num_fds(&self) -> usize {
                 self.num_fds
+            }
+        }
+
+        impl ConfigWithFDs for RestoredVfioConfig {
+            fn id(&self) -> Option<&str> {
+                Some(self.id.as_str())
+            }
+
+            fn fds_from_http_body(&self) -> Option<&[RawFd]> {
+                self.fd.as_ref().map(std::slice::from_ref)
+            }
+
+            fn set_fds(&mut self, fds: Option<Vec<RawFd>>) {
+                self.fd = fds.and_then(|mut v| v.pop());
+            }
+        }
+
+        impl ConfigWithVariableFDs for RestoredVfioConfig {
+            fn expected_num_fds(&self) -> usize {
+                1
             }
         }
     }
@@ -558,10 +579,33 @@ impl PutHandler for VmRestore {
         if let Some(body) = body {
             let mut restore_cfg: RestoreConfig = serde_json::from_slice(body.raw())?;
 
+            // Split incoming SCM_RIGHTS files in the order [net_fds..., vfio_fds...].
+            let mut files = files;
             if let Some(cfgs) = restore_cfg.net_fds.as_mut() {
+                let net_total: usize = cfgs.iter().map(|c| c.num_fds).sum();
+                if files.len() < net_total {
+                    error!(
+                        "Number of expected net FDs: {}, received: {}",
+                        net_total,
+                        files.len()
+                    );
+                    return Err(HttpError::BadRequest);
+                }
+                let net_files: Vec<File> = files.drain(..net_total).collect();
+                let mut cfgs = cfgs.iter_mut().collect::<Vec<&mut _>>();
+                let cfgs = cfgs.as_mut_slice();
+                attach_fds_to_cfgs(net_files, cfgs)?;
+            }
+            if let Some(cfgs) = restore_cfg.vfio_fds.as_mut() {
                 let mut cfgs = cfgs.iter_mut().collect::<Vec<&mut _>>();
                 let cfgs = cfgs.as_mut_slice();
                 attach_fds_to_cfgs(files, cfgs)?;
+            } else if !files.is_empty() {
+                error!(
+                    "Unexpected leftover FDs in VmRestore request: {}",
+                    files.len()
+                );
+                return Err(HttpError::BadRequest);
             }
 
             self.send(api_notifier, api_sender, restore_cfg)
