@@ -883,7 +883,7 @@ impl Vmm {
         listener: &ReceiveListener,
         state: ReceiveMigrationState,
         req: &Request,
-        _receive_data_migration: &VmReceiveMigrationData,
+        receive_data_migration: &VmReceiveMigrationData,
     ) -> std::result::Result<ReceiveMigrationState, MigratableError> {
         use ReceiveMigrationState::*;
 
@@ -893,11 +893,13 @@ impl Vmm {
             )))
         };
 
+        let vfio_fds = receive_data_migration.vfio_fds.as_deref();
         let mut configure_vm =
             |socket: &mut SocketStream,
              memory_files: HashMap<u32, File>|
              -> std::result::Result<ReceiveMigrationConfiguredData, MigratableError> {
-                let memory_manager = self.vm_receive_config(req, socket, memory_files)?;
+                let memory_manager =
+                    self.vm_receive_config(req, socket, memory_files, vfio_fds)?;
                 let guest_memory = memory_manager.lock().unwrap().guest_memory();
                 // Create the additional-connection receiver even in the single-connection case.
                 // At this point the receiver does not know whether the sender will use extra TCP
@@ -1024,6 +1026,7 @@ impl Vmm {
         req: &Request,
         socket: &mut T,
         existing_memory_files: HashMap<u32, File>,
+        vfio_fds: Option<&[crate::config::RestoredVfioConfig]>,
     ) -> std::result::Result<Arc<Mutex<MemoryManager>>, MigratableError>
     where
         T: Read,
@@ -1039,6 +1042,11 @@ impl Vmm {
             serde_json::from_slice(&data).map_err(|e| {
                 MigratableError::MigrateReceive(anyhow!("Error deserialising config: {e}"))
             })?;
+
+        // Mirrors vm_restore logic for RestoreConfig.vfio_fds.
+        if let Some(vfio_fds) = vfio_fds {
+            apply_vfio_fds_to_vm_config(vfio_fds, &vm_migration_config.vm_config)?;
+        }
 
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         self.vm_check_cpuid_compatibility(
@@ -1790,6 +1798,59 @@ impl Vmm {
 
 fn apply_landlock(vm_config: &mut VmConfig) -> result::Result<(), LandlockError> {
     vm_config.apply_landlock()?;
+    Ok(())
+}
+
+// Validate vfio_fds against the supplied VmConfig and, for each matched
+// DeviceConfig.id, swap path for the cdev FD passed in by the caller. Used
+// by the receive migration path after VmConfig arrives over the wire.
+fn apply_vfio_fds_to_vm_config(
+    vfio_fds: &[crate::config::RestoredVfioConfig],
+    vm_config: &Arc<Mutex<VmConfig>>,
+) -> result::Result<(), MigratableError> {
+    if vfio_fds.is_empty() {
+        return Ok(());
+    }
+
+    let mut config = vm_config.lock().unwrap();
+
+    let iommufd_on = config.platform.as_ref().is_some_and(|p| p.iommufd);
+    if !iommufd_on {
+        return Err(MigratableError::MigrateReceive(anyhow!(
+            "vfio_fds requires platform iommufd=on in the received VmConfig"
+        )));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for v in vfio_fds {
+        if !seen.insert(v.id.as_str()) {
+            return Err(MigratableError::MigrateReceive(anyhow!(
+                "duplicate vfio_fds id '{}'",
+                v.id
+            )));
+        }
+    }
+
+    if let Some(devices) = config.devices.as_mut() {
+        for v in vfio_fds {
+            let device = devices
+                .iter_mut()
+                .find(|d| d.pci_common.id.as_deref() == Some(v.id.as_str()))
+                .ok_or_else(|| {
+                    MigratableError::MigrateReceive(anyhow!(
+                        "vfio_fds id '{}' does not match any device in the received VmConfig",
+                        v.id
+                    ))
+                })?;
+            device.path = None;
+            device.fd = v.fd;
+        }
+    } else {
+        return Err(MigratableError::MigrateReceive(anyhow!(
+            "vfio_fds entries supplied but received VmConfig has no devices"
+        )));
+    }
+
     Ok(())
 }
 
@@ -3201,5 +3262,144 @@ mod unit_tests {
                 .unwrap(),
             vsock_config
         );
+    }
+
+    fn platform_with_iommufd(iommufd: bool) -> crate::vm_config::PlatformConfig {
+        crate::vm_config::PlatformConfig {
+            num_pci_segments: crate::vm_config::default_platformconfig_num_pci_segments(),
+            iommu_segments: None,
+            iommu_address_width_bits:
+                crate::vm_config::default_platformconfig_iommu_address_width_bits(),
+            serial_number: None,
+            uuid: None,
+            oem_strings: None,
+            iommufd,
+            vfio_p2p_dma: crate::vm_config::default_platformconfig_vfio_p2p_dma(),
+            #[cfg(feature = "tdx")]
+            tdx: false,
+            #[cfg(feature = "sev_snp")]
+            sev_snp: false,
+        }
+    }
+
+    fn vm_config_with_devices(
+        ids: &[&str],
+        iommufd: bool,
+    ) -> Arc<Mutex<VmConfig>> {
+        let mut config = *create_dummy_vm_config();
+        config.platform = Some(platform_with_iommufd(iommufd));
+        config.devices = Some(
+            ids.iter()
+                .map(|id| crate::vm_config::DeviceConfig {
+                    pci_common: crate::vm_config::PciDeviceCommonConfig {
+                        id: Some((*id).to_owned()),
+                        ..Default::default()
+                    },
+                    path: Some(PathBuf::from(format!("/sys/bus/pci/devices/{id}"))),
+                    fd: None,
+                    x_nv_gpudirect_clique: None,
+                    x_exclude_mmap_bars: Vec::new(),
+                })
+                .collect(),
+        );
+        Arc::new(Mutex::new(config))
+    }
+
+    #[test]
+    fn test_apply_vfio_fds_to_vm_config_empty_noop() {
+        let vm_config = vm_config_with_devices(&["vfio0"], true);
+        apply_vfio_fds_to_vm_config(&[], &vm_config).expect("empty vfio_fds is a no-op");
+        let config = vm_config.lock().unwrap();
+        let device = &config.devices.as_ref().unwrap()[0];
+        assert!(device.path.is_some(), "no-op should not rewrite path");
+        assert!(device.fd.is_none(), "no-op should not populate fd");
+    }
+
+    #[test]
+    fn test_apply_vfio_fds_to_vm_config_happy_path() {
+        let vm_config = vm_config_with_devices(&["vfio0", "vfio1"], true);
+        let fds = vec![
+            crate::config::RestoredVfioConfig {
+                id: "vfio0".to_owned(),
+                fd: Some(5),
+            },
+            crate::config::RestoredVfioConfig {
+                id: "vfio1".to_owned(),
+                fd: Some(7),
+            },
+        ];
+        apply_vfio_fds_to_vm_config(&fds, &vm_config).expect("happy path should succeed");
+        let config = vm_config.lock().unwrap();
+        let devices = config.devices.as_ref().unwrap();
+        assert_eq!(devices[0].path, None);
+        assert_eq!(devices[0].fd, Some(5));
+        assert_eq!(devices[1].path, None);
+        assert_eq!(devices[1].fd, Some(7));
+    }
+
+    #[test]
+    fn test_apply_vfio_fds_to_vm_config_iommufd_off() {
+        let vm_config = vm_config_with_devices(&["vfio0"], false);
+        let fds = vec![crate::config::RestoredVfioConfig {
+            id: "vfio0".to_owned(),
+            fd: Some(5),
+        }];
+        let err = apply_vfio_fds_to_vm_config(&fds, &vm_config)
+            .expect_err("iommufd off should be rejected");
+        assert!(matches!(err, MigratableError::MigrateReceive(_)));
+        // Confirm we did not mutate the device on the rejection path.
+        let config = vm_config.lock().unwrap();
+        let device = &config.devices.as_ref().unwrap()[0];
+        assert!(device.path.is_some());
+        assert!(device.fd.is_none());
+    }
+
+    #[test]
+    fn test_apply_vfio_fds_to_vm_config_unknown_id() {
+        let vm_config = vm_config_with_devices(&["vfio0"], true);
+        let fds = vec![crate::config::RestoredVfioConfig {
+            id: "missing".to_owned(),
+            fd: Some(5),
+        }];
+        let err = apply_vfio_fds_to_vm_config(&fds, &vm_config)
+            .expect_err("unknown id should be rejected");
+        assert!(matches!(err, MigratableError::MigrateReceive(_)));
+    }
+
+    #[test]
+    fn test_apply_vfio_fds_to_vm_config_duplicate_id() {
+        let vm_config = vm_config_with_devices(&["vfio0"], true);
+        let fds = vec![
+            crate::config::RestoredVfioConfig {
+                id: "vfio0".to_owned(),
+                fd: Some(5),
+            },
+            crate::config::RestoredVfioConfig {
+                id: "vfio0".to_owned(),
+                fd: Some(6),
+            },
+        ];
+        let err = apply_vfio_fds_to_vm_config(&fds, &vm_config)
+            .expect_err("duplicate id should be rejected");
+        assert!(matches!(err, MigratableError::MigrateReceive(_)));
+        // Confirm we did not partially mutate on the rejection path.
+        let config = vm_config.lock().unwrap();
+        let device = &config.devices.as_ref().unwrap()[0];
+        assert!(device.path.is_some());
+        assert!(device.fd.is_none());
+    }
+
+    #[test]
+    fn test_apply_vfio_fds_to_vm_config_no_devices() {
+        let mut config = *create_dummy_vm_config();
+        config.platform = Some(platform_with_iommufd(true));
+        let vm_config = Arc::new(Mutex::new(config));
+        let fds = vec![crate::config::RestoredVfioConfig {
+            id: "vfio0".to_owned(),
+            fd: Some(5),
+        }];
+        let err = apply_vfio_fds_to_vm_config(&fds, &vm_config)
+            .expect_err("no devices should be rejected");
+        assert!(matches!(err, MigratableError::MigrateReceive(_)));
     }
 }

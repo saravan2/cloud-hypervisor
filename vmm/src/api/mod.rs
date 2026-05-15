@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use log::info;
 use micro_http::Body;
-use option_parser::{OptionParser, OptionParserError, Toggle};
+use option_parser::{OptionParser, OptionParserError, Toggle, Tuple};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_migration::MigratableError;
@@ -51,7 +51,7 @@ use vmm_sys_util::eventfd::EventFd;
 pub use self::dbus::start_dbus_thread;
 pub use self::http::{start_http_fd_thread, start_http_path_thread};
 use crate::Error as VmmError;
-use crate::config::RestoreConfig;
+use crate::config::{RestoreConfig, RestoredVfioConfig};
 use crate::device_tree::DeviceTree;
 use crate::migration_transport::MAX_MIGRATION_CONNECTIONS;
 use crate::vm::{Error as VmError, VmState};
@@ -265,10 +265,55 @@ pub struct VmCoredumpData {
     pub destination_url: String,
 }
 
+#[derive(Debug, Error)]
+pub enum VmReceiveMigrationConfigError {
+    #[error("Error parsing receive migration parameters")]
+    ParseError(#[source] OptionParserError),
+}
+
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
 pub struct VmReceiveMigrationData {
     /// URL for the reception of migration state
     pub receiver_url: String,
+    /// Optional VFIO device id to cdev FD pairs, used to substitute the
+    /// destination's cdev FD for the source's sysfs path on receive.
+    #[serde(default)]
+    pub vfio_fds: Option<Vec<RestoredVfioConfig>>,
+}
+
+impl VmReceiveMigrationData {
+    pub const SYNTAX: &'static str = "VM receive migration parameters \
+        \"receiver_url=<url>[,vfio_fds=<list_of_vfio_ids_with_their_associated_fd>]\"";
+
+    pub fn parse(config: &str) -> Result<Self, VmReceiveMigrationConfigError> {
+        let mut parser = OptionParser::new();
+        parser.add("receiver_url").add("vfio_fds");
+        parser
+            .parse(config)
+            .map_err(VmReceiveMigrationConfigError::ParseError)?;
+
+        let receiver_url = parser.get("receiver_url").ok_or_else(|| {
+            VmReceiveMigrationConfigError::ParseError(OptionParserError::InvalidSyntax(
+                "receiver_url is required".to_string(),
+            ))
+        })?;
+        let vfio_fds = parser
+            .convert::<Tuple<String, u64>>("vfio_fds")
+            .map_err(VmReceiveMigrationConfigError::ParseError)?
+            .map(|v| {
+                v.0.into_iter()
+                    .map(|(id, fd)| RestoredVfioConfig {
+                        id,
+                        fd: Some(fd as i32),
+                    })
+                    .collect()
+            });
+
+        Ok(Self {
+            receiver_url,
+            vfio_fds,
+        })
+    }
 }
 
 #[derive(Copy, Clone, Default, Deserialize, Serialize, Debug, PartialEq, Eq)]
@@ -1856,5 +1901,46 @@ mod unit_tests {
                 connections: NonZeroU32::new(4).unwrap(),
             }
         );
+    }
+
+    #[test]
+    fn test_vm_receive_migration_data_parse() {
+        // Minimal receiver_url only
+        let data = VmReceiveMigrationData::parse("receiver_url=tcp:0.0.0.0:9000")
+            .expect("minimal receive migration string should parse");
+        assert_eq!(data.receiver_url, "tcp:0.0.0.0:9000");
+        assert!(data.vfio_fds.is_none());
+
+        // receiver_url plus a single vfio_fds entry
+        let data = VmReceiveMigrationData::parse(
+            "receiver_url=tcp:0.0.0.0:9000,vfio_fds=[vfio0@5]",
+        )
+        .expect("receiver_url plus vfio_fds should parse");
+        assert_eq!(data.receiver_url, "tcp:0.0.0.0:9000");
+        let fds = data.vfio_fds.expect("vfio_fds populated");
+        assert_eq!(fds.len(), 1);
+        assert_eq!(fds[0].id, "vfio0");
+        assert_eq!(fds[0].fd, Some(5));
+
+        // receiver_url plus multiple vfio_fds entries
+        let data = VmReceiveMigrationData::parse(
+            "receiver_url=unix:/tmp/sock,vfio_fds=[vfio0@5,vfio1@7]",
+        )
+        .expect("multi vfio_fds entry list should parse");
+        let fds = data.vfio_fds.expect("vfio_fds populated");
+        assert_eq!(fds.len(), 2);
+        assert_eq!(fds[0].id, "vfio0");
+        assert_eq!(fds[0].fd, Some(5));
+        assert_eq!(fds[1].id, "vfio1");
+        assert_eq!(fds[1].fd, Some(7));
+
+        // Missing receiver_url is an error
+        VmReceiveMigrationData::parse("vfio_fds=[vfio0@5]").unwrap_err();
+
+        // Unknown option is an error
+        VmReceiveMigrationData::parse(
+            "receiver_url=tcp:0.0.0.0:9000,unknown_field=foo",
+        )
+        .unwrap_err();
     }
 }

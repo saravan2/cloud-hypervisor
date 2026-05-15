@@ -49,8 +49,8 @@ use crate::api::{
     AddDisk, ApiAction, ApiError, ApiRequest, DeviceConfig, NetConfig, VmAddDevice, VmAddFs,
     VmAddGenericVhostUser, VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot,
     VmConfig, VmCounters, VmDelete, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
-    VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration,
-    VmShutdown, VmSnapshot,
+    VmReceiveMigrationData, VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore,
+    VmResume, VmSendMigration, VmShutdown, VmSnapshot,
 };
 use crate::config::RestoreConfig;
 use crate::cpu::Error as CpuError;
@@ -480,7 +480,6 @@ vm_action_put_handler_body!(VmRemoveDevice);
 vm_action_put_handler_body!(VmResizeDisk);
 vm_action_put_handler_body!(VmResizeZone);
 vm_action_put_handler_body!(VmSnapshot);
-vm_action_put_handler_body!(VmReceiveMigration);
 vm_action_put_handler_body!(VmSendMigration);
 
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -617,6 +616,41 @@ impl PutHandler for VmRestore {
 }
 
 impl GetHandler for VmRestore {}
+
+// Special handling for VFIO devices backed by an externally-opened cdev FD.
+// See module description for more info.
+impl PutHandler for VmReceiveMigration {
+    fn handle_request(
+        &'static self,
+        api_notifier: EventFd,
+        api_sender: Sender<ApiRequest>,
+        body: &Option<Body>,
+        files: Vec<File>,
+    ) -> std::result::Result<Option<Body>, HttpError> {
+        if let Some(body) = body {
+            let mut data: VmReceiveMigrationData = serde_json::from_slice(body.raw())?;
+
+            if let Some(cfgs) = data.vfio_fds.as_mut() {
+                let mut cfgs = cfgs.iter_mut().collect::<Vec<&mut _>>();
+                let cfgs = cfgs.as_mut_slice();
+                attach_fds_to_cfgs(files, cfgs)?;
+            } else if !files.is_empty() {
+                error!(
+                    "Unexpected leftover FDs in VmReceiveMigration request: {}",
+                    files.len()
+                );
+                return Err(HttpError::BadRequest);
+            }
+
+            self.send(api_notifier, api_sender, data)
+                .map_err(HttpError::ApiError)
+        } else {
+            Err(HttpError::BadRequest)
+        }
+    }
+}
+
+impl GetHandler for VmReceiveMigration {}
 
 // Common handler for boot, shutdown and reboot
 pub struct VmActionHandler {

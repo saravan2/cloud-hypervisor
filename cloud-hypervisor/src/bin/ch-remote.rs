@@ -73,6 +73,8 @@ enum Error {
     InvalidDiskSize(#[source] ByteSizedParseError),
     #[error("Error parsing send migration configuration")]
     SendMigrationConfig(#[from] vmm::api::VmSendMigrationConfigError),
+    #[error("Error parsing receive migration configuration")]
+    ReceiveMigrationConfig(#[from] vmm::api::VmReceiveMigrationConfigError),
 }
 
 enum TargetApi<'a> {
@@ -528,18 +530,19 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
                 .map_err(Error::HttpApiClient)
         }
         Some("receive-migration") => {
-            let receive_migration_data = receive_migration_data(
+            let (receive_migration_data, fds) = receive_migration_data(
                 matches
                     .subcommand_matches("receive-migration")
                     .unwrap()
                     .get_one::<String>("receive_migration_config")
                     .unwrap(),
-            );
-            simple_api_command(
+            )?;
+            simple_api_command_with_fds(
                 socket,
                 "PUT",
                 "receive-migration",
                 Some(&receive_migration_data),
+                &fds,
             )
             .map_err(Error::HttpApiClient)
         }
@@ -747,13 +750,13 @@ fn dbus_api_do_command(matches: &ArgMatches, proxy: &DBusApi1ProxyBlocking<'_>) 
             proxy.api_vm_send_migration(&send_migration_data)
         }
         Some("receive-migration") => {
-            let receive_migration_data = receive_migration_data(
+            let (receive_migration_data, _fds) = receive_migration_data(
                 matches
                     .subcommand_matches("receive-migration")
                     .unwrap()
                     .get_one::<String>("receive_migration_config")
                     .unwrap(),
-            );
+            )?;
             proxy.api_vm_receive_migration(&receive_migration_data)
         }
         Some("create") => {
@@ -955,12 +958,27 @@ fn coredump_config(destination_url: &str) -> String {
     serde_json::to_string(&coredump_config).unwrap()
 }
 
-fn receive_migration_data(url: &str) -> String {
-    let receive_migration_data = vmm::api::VmReceiveMigrationData {
-        receiver_url: url.to_owned(),
+fn receive_migration_data(config: &str) -> Result<(String, Vec<i32>), Error> {
+    // The canonical form is receiver_url=<url>[,vfio_fds=...]. If the input
+    // does not start with receiver_url=, prepend it so a URL alone (or a URL
+    // plus additional options) flows through the shared key=value parser.
+    let normalized = if config.starts_with("receiver_url=") {
+        config.to_owned()
+    } else {
+        format!("receiver_url={config}")
+    };
+    let mut data = vmm::api::VmReceiveMigrationData::parse(&normalized)
+        .map_err(Error::ReceiveMigrationConfig)?;
+
+    // Drain the cdev FDs into the SCM_RIGHTS pool.
+    let fds = if let Some(vfio_fds) = data.vfio_fds.as_mut() {
+        vfio_fds.iter_mut().filter_map(|v| v.fd.take()).collect()
+    } else {
+        Vec::new()
     };
 
-    serde_json::to_string(&receive_migration_data).unwrap()
+    let json = serde_json::to_string(&data).unwrap();
+    Ok((json, fds))
 }
 
 fn send_migration_data(config: &str) -> Result<String, Error> {
@@ -1083,7 +1101,7 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
             .arg(
                 Arg::new("receive_migration_config")
                     .index(1)
-                    .help("<receiver_url>"),
+                    .help(vmm::api::VmReceiveMigrationData::SYNTAX),
             ),
         Command::new("remove-device")
             .about("Remove VFIO and PCI device")
