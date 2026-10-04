@@ -9361,6 +9361,16 @@ mod ivshmem {
     }
 
     #[test]
+    fn test_snapshot_restore_vmgenid() {
+        snapshot_restore_common::_test_snapshot_restore(
+            snapshot_restore_common::SnapshotRestoreTest {
+                check_vmgenid: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
     fn test_snapshot_restore_with_resume() {
         snapshot_restore_common::_test_snapshot_restore(
             snapshot_restore_common::SnapshotRestoreTest {
@@ -9546,6 +9556,7 @@ mod snapshot_restore_common {
         pub check_clock: bool,
         pub memory_restore_mode: Option<&'static str>,
         pub use_prefault: bool,
+        pub check_vmgenid: bool,
     }
 
     pub(crate) fn _test_snapshot_restore(cfg: SnapshotRestoreTest) {
@@ -9555,6 +9566,7 @@ mod snapshot_restore_common {
             check_clock,
             memory_restore_mode,
             use_prefault,
+            check_vmgenid,
         } = cfg;
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
@@ -9584,11 +9596,15 @@ mod snapshot_restore_common {
         // x86_64: force kvm-clock — the restore catch-up moves kvmclock (KVM_SET_CLOCK),
         // not the tsc clocksource, so a tsc guest wouldn't catch up. aarch64 ignores this
         // (CNTVCT is advanced directly).
-        let boot_cmdline = if check_clock && cfg!(target_arch = "x86_64") {
-            format!("{DIRECT_KERNEL_BOOT_CMDLINE} clocksource=kvm-clock")
-        } else {
-            DIRECT_KERNEL_BOOT_CMDLINE.to_string()
-        };
+        let mut boot_cmdline = DIRECT_KERNEL_BOOT_CMDLINE.to_string();
+        if check_clock && cfg!(target_arch = "x86_64") {
+            boot_cmdline.push_str(" clocksource=kvm-clock");
+        }
+        if check_vmgenid {
+            // The VM Generation ID device is ACPI only. aarch64 direct boot
+            // defaults to the FDT, so force ACPI to enumerate the device.
+            boot_cmdline.push_str(" acpi=force");
+        }
 
         let mut child = GuestCommand::new(&guest)
             .args(["--api-socket", &api_socket_source])
@@ -9817,6 +9833,35 @@ mod snapshot_restore_common {
 
             #[cfg(target_arch = "x86_64")]
             guest.remove_test_disk(&api_socket_restored);
+
+            if check_vmgenid {
+                // Restore raised the GED interrupt carrying the new generation
+                // ID. Nothing else drives the GED in this test, so the count is
+                // zero before the snapshot and non-zero once it fires.
+                let ged_count = guest
+                    .ssh_command(
+                        "grep 'ACPI:Ged' /proc/interrupts | \
+                         awk '{s=0; for(i=2;i<=NF;i++) if($i~/^[0-9]+$/) s+=$i; print s}'",
+                    )
+                    .unwrap_or_default();
+                assert!(
+                    ged_count.trim().parse::<u64>().unwrap_or(0) >= 1,
+                    "GED interrupt did not fire after restore (count: {ged_count:?})"
+                );
+
+                // The guest vmgenid driver reseeds the kernel RNG on that
+                // notification. Poll since the reseed lands just after resume.
+                assert!(
+                    wait_until(Duration::from_secs(20), || {
+                        guest
+                            .ssh_command(
+                                "dmesg | grep -c 'crng reseeded due to virtual machine fork'",
+                            )
+                            .is_ok_and(|c| c.trim() != "0")
+                    }),
+                    "guest did not reseed its RNG after the VM Generation ID changed"
+                );
+            }
 
             if check_clock {
                 // Across the off-host interval the restored guest's wall clock
